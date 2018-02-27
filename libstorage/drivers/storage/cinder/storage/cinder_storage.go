@@ -19,6 +19,8 @@ import (
 	"github.com/gophercloud/gophercloud/openstack/blockstorage/v2/volumes"
 	"github.com/gophercloud/gophercloud/openstack/compute/v2/extensions/volumeattach"
 	"github.com/gophercloud/gophercloud/openstack/identity/v3/extensions/trusts"
+	"fmt"
+	"os"
 )
 
 const (
@@ -637,7 +639,32 @@ func (d *driver) VolumeAttach(
 			fields, "error waiting for volume to attach", err)
 	}
 
-	return volume, volumeAttach.Device, nil
+	//
+	// never trust cinder, it's even in the docs:
+	// * https://docs.openstack.org/nova/latest/user/block-device-mapping.html#intermezzo-problem-with-device-names
+	//
+	failHard := true
+	realDevice, err := getAttachedDevicePathByID(volumeID)
+	if err != nil {
+		// fail hard?
+		if failHard {
+			return nil, "", goof.WithError("the real device does not exist sucker", err)
+		} else {
+			// soft fail (try with cinder device)
+			realDevice = volumeAttach.Device
+		}
+	}
+
+	return volume, realDevice, nil
+}
+
+func getAttachedDevicePathByID(volumeID string) (string, error) {
+	linkedDeviceString := fmt.Sprintf("/dev/disk/by-id/virtio-%s", volumeID[:20])
+	if deviceString, err := os.Readlink(linkedDeviceString); err == nil {
+		return deviceString, nil
+	} else {
+		return "", err
+	}
 }
 
 func (d *driver) VolumeDetach(
