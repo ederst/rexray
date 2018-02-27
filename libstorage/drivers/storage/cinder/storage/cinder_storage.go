@@ -20,7 +20,7 @@ import (
 	"github.com/gophercloud/gophercloud/openstack/compute/v2/extensions/volumeattach"
 	"github.com/gophercloud/gophercloud/openstack/identity/v3/extensions/trusts"
 	"fmt"
-	"os"
+	"path/filepath"
 )
 
 const (
@@ -237,6 +237,8 @@ func (d *driver) VolumeInspect(
 		return nil, goof.New("no volumeID specified")
 	}
 
+	var translatedVolume *types.Volume
+
 	if d.clientBlockStoragev2 != nil {
 		volume, err := volumes.Get(d.clientBlockStoragev2, volumeID).Extract()
 
@@ -245,17 +247,65 @@ func (d *driver) VolumeInspect(
 				goof.WithFieldsE(fields, "error getting volume", err)
 		}
 
-		return translateVolume(volume, opts.Attachments), nil
+		translatedVolume = translateVolume(volume, opts.Attachments)
+	} else {
+
+		volume, err := volumesv1.Get(d.clientBlockStorage, volumeID).Extract()
+
+		if err != nil {
+			return nil,
+				goof.WithFieldsE(fields, "error getting volume", err)
+		}
+
+		translatedVolume = translateVolumeV1(volume, opts.Attachments)
 	}
 
-	volume, err := volumesv1.Get(d.clientBlockStorage, volumeID).Extract()
-
+	//
+	// doing this only in VolumeInspect might be enough, but not 100% right?
+	//
+	translatedVolume, err := getRealDeviceNameByID(ctx, translatedVolume)
 	if err != nil {
-		return nil,
-			goof.WithFieldsE(fields, "error getting volume", err)
+		return nil, goof.WithFieldsE(fields, "error getting real device", err)
 	}
 
-	return translateVolumeV1(volume, opts.Attachments), nil
+	return translatedVolume, nil
+}
+
+//
+// never trust cinder, even the OpenStack docs say this:
+// * https://docs.openstack.org/nova/latest/user/block-device-mapping.html#intermezzo-problem-with-device-names
+//
+func getRealDeviceNameByID(
+	ctx types.Context,
+	volume *types.Volume) (*types.Volume, error) {
+    // TODO make configurable?
+	failHard := true
+
+	fields := eff(goof.Fields{
+		"volumeId": volume.ID,
+	})
+
+	ctx.WithFields(fields).Debug("try to get real device name from /dev/disk/by-id")
+
+	iid := context.MustInstanceID(ctx).ID
+
+	for _, attachment := range volume.Attachments{
+		if attachment.InstanceID.ID == iid {
+			volumeID := attachment.VolumeID
+			linkedDeviceString := fmt.Sprintf("/dev/disk/by-id/virtio-%s", volumeID[:20])
+
+			if realDeviceName, err := filepath.EvalSymlinks(linkedDeviceString); err == nil {
+				if realDeviceName != attachment.DeviceName {
+					ctx.WithFields(fields).Warn(fmt.Sprintf("cinder reported wrong device name, replacing %s with %s", attachment.DeviceName, realDeviceName))
+					attachment.DeviceName = realDeviceName
+				}
+			} else if failHard {
+				return nil, err
+			}
+		}
+	}
+
+	return volume, nil
 }
 
 func translateVolumeV1(
@@ -626,7 +676,7 @@ func (d *driver) VolumeAttach(
 		options.Device = *opts.NextDevice
 	}
 
-	volumeAttach, err := volumeattach.Create(d.clientCompute, iid.ID, options).Extract()
+	_, err = volumeattach.Create(d.clientCompute, iid.ID, options).Extract()
 	if err != nil {
 		return nil, "", goof.WithFieldsE(
 			fields, "error attaching volume", err)
@@ -640,31 +690,22 @@ func (d *driver) VolumeAttach(
 	}
 
 	//
-	// never trust cinder, it's even in the docs:
-	// * https://docs.openstack.org/nova/latest/user/block-device-mapping.html#intermezzo-problem-with-device-names
+	// get deviceName from volume Attachments of the current instance
+	// b/c volumeattach.Create might report wrong device
 	//
-	failHard := true
-	realDevice, err := getAttachedDevicePathByID(volumeID)
-	if err != nil {
-		// fail hard?
-		if failHard {
-			return nil, "", goof.WithError("the real device does not exist sucker", err)
-		} else {
-			// soft fail (try with cinder device)
-			realDevice = volumeAttach.Device
+	deviceName := ""
+	for _, attachment := range volume.Attachments {
+		if attachment.InstanceID.ID == iid.ID {
+			deviceName = attachment.DeviceName
 		}
 	}
 
-	return volume, realDevice, nil
-}
-
-func getAttachedDevicePathByID(volumeID string) (string, error) {
-	linkedDeviceString := fmt.Sprintf("/dev/disk/by-id/virtio-%s", volumeID[:20])
-	if deviceString, err := os.Readlink(linkedDeviceString); err == nil {
-		return deviceString, nil
-	} else {
-		return "", err
+	if deviceName == "" {
+		return nil, "", goof.WithFieldsE(fields,
+			fmt.Sprintf("unable to determine device name for volume %s on instance %s", volumeID, iid.ID), err)
 	}
+
+	return volume, deviceName, nil
 }
 
 func (d *driver) VolumeDetach(
